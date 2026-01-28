@@ -7,9 +7,61 @@
 | Lambda関数数 | 100個 |
 | ランタイム | .NET 8 (C#) |
 | 月間ログ量（想定） | 100GB |
+| ログレベル分布 | CRIT: 0.1%, ERROR: 1%, WARN: 5%, INFO: 93.9% |
 | アプリ別パーティション | 必要（100アプリ） |
 | 日付別パーティション | 必要（year/month/day） |
 | リージョン | ap-northeast-1 (東京) |
+
+## アラート要件
+
+| レベル | 条件 | 通知方法 | 対応 |
+|--------|------|---------|------|
+| **CRITICAL** | 1件発生で即時 | SNS → PagerDuty/Slack | 即時対応必須 |
+| **ERROR** | 1件発生で即時 | SNS → Slack/Email | 当日中対応 |
+| **WARN** | 5分間で10件以上 | SNS → Slack | 翌営業日対応 |
+
+### アラート実現方法（Firehose構成の場合）
+
+Firehose はデータ配信に特化しているため、**アラートは別途CloudWatch側で設定**が必要：
+
+```mermaid
+flowchart LR
+    subgraph Lambda["Lambda (100個)"]
+        L[アプリログ]
+    end
+
+    subgraph CW["CloudWatch Logs"]
+        LG_STD["Standard Class<br/>ERROR/WARN用"]
+        LG_DEL["Delivery Class<br/>全ログ用"]
+    end
+
+    subgraph Alert["アラート系"]
+        MF["Metric Filter"]
+        Alarm["CloudWatch Alarm"]
+        SNS["SNS Topic"]
+    end
+
+    subgraph Storage["ストレージ系"]
+        FH["Firehose"]
+        S3["S3"]
+    end
+
+    L -->|ERROR/WARN| LG_STD
+    L -->|全ログ| LG_DEL
+
+    LG_STD --> MF
+    MF --> Alarm
+    Alarm --> SNS
+
+    LG_DEL --> FH
+    FH --> S3
+```
+
+**ポイント**: 
+- ERROR/WARN → CloudWatch Standard（Metric Filter対応）→ アラート
+- 全ログ → CloudWatch Delivery → Firehose → S3（長期保存・分析用）
+
+---
 
 ## Firehose 課金要素
 
@@ -28,20 +80,31 @@
 
 ## 構成パターン比較サマリ
 
-| # | パターン名 | コスト/月 | Athena最適化 | リアルタイム性 | 推奨度 |
-|---|-----------|----------|-------------|--------------|--------|
-| 1 | 基本構成（JSON） | ~$31 | △ | ○ | ○ |
-| 2 | 動的パーティショニング | ~$35 | ◎ | ○ | ◎ |
-| 3 | Parquet変換 | ~$34 | ◎ | △ | ◎ |
-| 4 | Lambda変換 + 動的パーティション | ~$38 | ◎ | ○ | ○ |
-| 5 | マルチ宛先（S3 + OpenSearch） | ~$85 | ◎ | ◎ | △ |
+| # | パターン名 | コスト/月 | Athena最適化 | アラート対応 | 推奨度 |
+|---|-----------|----------|-------------|-------------|--------|
+| 1 | 基本構成（JSON）+ アラート | ~$31 | △ | ◎ CW Metric Filter | ○ |
+| 2 | 動的パーティショニング + アラート | ~$35 | ◎ | ◎ CW Metric Filter | ◎ |
+| 3 | Parquet変換 + アラート | ~$36 | ◎ | ◎ CW Metric Filter | ◎ |
+| 4 | Lambda変換 + 動的パーティション | ~$38 | ◎ | ◎ Lambda内で可 | ○ |
+| 5 | マルチ宛先（S3 + OpenSearch） | ~$95 | ◎ | ◎ OpenSearch | △ |
+
+### アラート要件（全パターン共通）
+
+| レベル | 条件 | 通知先 |
+|--------|------|--------|
+| **CRITICAL** | 1件発生で即時 | SNS → PagerDuty/Slack |
+| **ERROR** | 1件発生で即時 | SNS → Slack/Email |
+| **WARN** | 5分間で10件以上 | SNS → Slack |
+
+※ **Firehose単体ではアラート不可**。CloudWatch Metric Filter または OpenSearch Alerting が必要。
 
 ---
 
-## パターン1: 基本構成（JSON）
+## パターン1: 基本構成（JSON）+ アラート
 
 ### 概要
 最もシンプルな構成。CloudWatch Logs → Firehose → S3 にJSON形式で配信。
+**アラートはCloudWatch Standard側で設定。**
 
 ### 構成図
 
@@ -53,8 +116,19 @@ flowchart TB
         L100[Lambda 100]
     end
 
-    subgraph CloudWatch["CloudWatch Logs (Delivery Class)"]
-        LG["共通ロググループ<br/>/app/lambda/all"]
+    subgraph CloudWatch["CloudWatch Logs"]
+        LG_STD["Standard Class<br/>/app/lambda/errors<br/>ERROR/WARN用"]
+        LG_DEL["Delivery Class<br/>/app/lambda/all<br/>全ログ用"]
+    end
+
+    subgraph Alert["アラート"]
+        MF_CRIT["Metric Filter<br/>CRITICAL"]
+        MF_ERR["Metric Filter<br/>ERROR"]
+        MF_WARN["Metric Filter<br/>WARN"]
+        A_CRIT["Alarm<br/>≥1/1min"]
+        A_ERR["Alarm<br/>≥1/1min"]
+        A_WARN["Alarm<br/>≥10/5min"]
+        SNS["SNS Topics"]
     end
 
     subgraph Firehose["Amazon Data Firehose"]
@@ -69,26 +143,47 @@ flowchart TB
         Athena["Athena"]
     end
 
-    L1 --> LG
-    L2 --> LG
-    L100 --> LG
+    L1 -->|ERROR/WARN| LG_STD
+    L2 -->|ERROR/WARN| LG_STD
+    L100 -->|ERROR/WARN| LG_STD
 
-    LG -->|Subscription Filter| FH
+    L1 -->|全ログ| LG_DEL
+    L2 -->|全ログ| LG_DEL
+    L100 -->|全ログ| LG_DEL
+
+    LG_STD --> MF_CRIT
+    LG_STD --> MF_ERR
+    LG_STD --> MF_WARN
+
+    MF_CRIT --> A_CRIT
+    MF_ERR --> A_ERR
+    MF_WARN --> A_WARN
+
+    A_CRIT --> SNS
+    A_ERR --> SNS
+    A_WARN --> SNS
+
+    LG_DEL -->|Subscription Filter| FH
     FH -->|GZIP圧縮| Bucket
 
     Bucket --> Athena
 ```
 
-### 費用内訳 (100GB/月)
+### 費用内訳 (100GB/月、ERROR/WARN 6GB)
 
 | 項目 | 計算 | 費用/月 |
 |------|------|--------|
-| CloudWatch Logs 取り込み (Delivery) | 100GB × $0.25 | $25.00 |
-| Firehose 取り込み (Vended Logs) | 100GB × $0.13 | **$0.00** ※ |
-| CloudWatch Logs 解凍 | 100GB × $0.0042 | $0.42 |
-| S3 ストレージ | 100GB × $0.025 | $2.50 |
-| S3 PUT リクエスト | ~2,000件 × $0.0047/1000 | $0.01 |
-| **合計** | | **~$27.93** |
+| **アラート用 (Standard)** | | |
+| └ CW Logs 取り込み | 6GB × $0.50 | $3.00 |
+| └ CW Logs 保存 (7日) | 6GB × 7/30 × $0.033 | $0.05 |
+| └ Metric Filter | 無料 | $0.00 |
+| └ CloudWatch Alarm (3個) | 3 × $0.10 | $0.30 |
+| **ストレージ用 (Delivery→S3)** | | |
+| └ CW Logs 取り込み | 100GB × $0.25 | $25.00 |
+| └ CW Logs 解凍 | 100GB × $0.0042 | $0.42 |
+| └ S3 ストレージ | 100GB × $0.025 | $2.50 |
+| └ S3 PUT リクエスト | ~2,000件 × $0.0047/1000 | $0.01 |
+| **合計** | | **~$31.28** |
 
 ※ Vended Logs経由の場合、Firehose取り込み料金は CloudWatch Logs 配信料金に含まれる
 
@@ -139,6 +234,126 @@ resource "aws_cloudwatch_log_subscription_filter" "to_firehose" {
   destination_arn = aws_kinesis_firehose_delivery_stream.basic.arn
   role_arn        = aws_iam_role.cloudwatch_to_firehose.arn
 }
+
+# =============================================================================
+# アラート設定（ERROR/WARN用のStandardロググループ）
+# =============================================================================
+
+# ERROR/WARN用ロググループ (Standard Class)
+resource "aws_cloudwatch_log_group" "errors" {
+  name              = "/app/lambda/errors"
+  retention_in_days = 7
+  # log_group_class = "STANDARD" (default)
+}
+
+# CRITICAL Metric Filter
+resource "aws_cloudwatch_log_metric_filter" "critical" {
+  name           = "critical-errors"
+  pattern        = "{ $.level = \"Critical\" }"
+  log_group_name = aws_cloudwatch_log_group.errors.name
+
+  metric_transformation {
+    name          = "CriticalCount"
+    namespace     = "App/Lambda/Logs"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+# ERROR Metric Filter
+resource "aws_cloudwatch_log_metric_filter" "error" {
+  name           = "errors"
+  pattern        = "{ $.level = \"Error\" }"
+  log_group_name = aws_cloudwatch_log_group.errors.name
+
+  metric_transformation {
+    name          = "ErrorCount"
+    namespace     = "App/Lambda/Logs"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+# WARN Metric Filter
+resource "aws_cloudwatch_log_metric_filter" "warn" {
+  name           = "warnings"
+  pattern        = "{ $.level = \"Warning\" || $.level = \"Warn\" }"
+  log_group_name = aws_cloudwatch_log_group.errors.name
+
+  metric_transformation {
+    name          = "WarnCount"
+    namespace     = "App/Lambda/Logs"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+# SNS Topics
+resource "aws_sns_topic" "critical" {
+  name = "lambda-logs-critical"
+}
+
+resource "aws_sns_topic" "error" {
+  name = "lambda-logs-error"
+}
+
+resource "aws_sns_topic" "warning" {
+  name = "lambda-logs-warning"
+}
+
+# CRITICAL Alarm (即時: 1件で発報)
+resource "aws_cloudwatch_metric_alarm" "critical" {
+  alarm_name          = "lambda-critical-alarm"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "CriticalCount"
+  namespace           = "App/Lambda/Logs"
+  period              = 60  # 1分
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "CRITICAL: 即時対応が必要です"
+
+  alarm_actions = [aws_sns_topic.critical.arn]
+  ok_actions    = [aws_sns_topic.critical.arn]
+
+  treat_missing_data = "notBreaching"
+}
+
+# ERROR Alarm (即時: 1件で発報)
+resource "aws_cloudwatch_metric_alarm" "error" {
+  alarm_name          = "lambda-error-alarm"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ErrorCount"
+  namespace           = "App/Lambda/Logs"
+  period              = 60  # 1分
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "ERROR: 当日中の対応が必要です"
+
+  alarm_actions = [aws_sns_topic.error.arn]
+  ok_actions    = [aws_sns_topic.error.arn]
+
+  treat_missing_data = "notBreaching"
+}
+
+# WARN Alarm (頻度ベース: 5分で10件以上)
+resource "aws_cloudwatch_metric_alarm" "warn" {
+  alarm_name          = "lambda-warn-alarm"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "WarnCount"
+  namespace           = "App/Lambda/Logs"
+  period              = 300  # 5分
+  statistic           = "Sum"
+  threshold           = 10   # 10件以上
+  alarm_description   = "WARN: 5分間で10件以上のWarningが発生"
+
+  alarm_actions = [aws_sns_topic.warning.arn]
+  ok_actions    = [aws_sns_topic.warning.arn]
+
+  treat_missing_data = "notBreaching"
+}
 ```
 
 ### メリット・デメリット
@@ -146,7 +361,7 @@ resource "aws_cloudwatch_log_subscription_filter" "to_firehose" {
 | メリット | デメリット |
 |---------|-----------|
 | 設定がシンプル | アプリ別にディレクトリ分離されない |
-| コストが最も低い | Athenaクエリが遅い（全スキャン） |
+| アラート設定も含めて完結 | Athenaクエリが遅い（全スキャン） |
 | 運用が容易 | パーティション投影が使えない |
 
 ---
@@ -155,6 +370,7 @@ resource "aws_cloudwatch_log_subscription_filter" "to_firehose" {
 
 ### 概要
 JQでアプリ名を抽出し、アプリ別・日付別にS3パスを動的に生成。Athena最適化。
+**アラートはパターン1と同様にCloudWatch Standard側で設定。**
 
 ### 構成図
 
@@ -166,8 +382,15 @@ flowchart TB
         L100["user-service"]
     end
 
-    subgraph CloudWatch["CloudWatch Logs (Delivery)"]
-        LG["共通ロググループ"]
+    subgraph CloudWatch["CloudWatch Logs"]
+        LG_STD["Standard Class<br/>ERROR/WARN用"]
+        LG_DEL["Delivery Class<br/>全ログ用"]
+    end
+
+    subgraph Alert["アラート"]
+        MF["Metric Filters<br/>CRIT/ERROR/WARN"]
+        Alarm["CloudWatch Alarms"]
+        SNS["SNS → Slack/PagerDuty"]
     end
 
     subgraph Firehose["Amazon Data Firehose"]
@@ -186,11 +409,19 @@ flowchart TB
         Athena["Athena<br/>パーティション投影"]
     end
 
-    L1 --> LG
-    L2 --> LG
-    L100 --> LG
+    L1 -->|ERROR/WARN| LG_STD
+    L2 -->|ERROR/WARN| LG_STD
+    L100 -->|ERROR/WARN| LG_STD
 
-    LG --> FH
+    L1 -->|全ログ| LG_DEL
+    L2 -->|全ログ| LG_DEL
+    L100 -->|全ログ| LG_DEL
+
+    LG_STD --> MF
+    MF --> Alarm
+    Alarm --> SNS
+
+    LG_DEL --> FH
     FH --> JQ
     JQ --> DP
     DP --> S3_1
@@ -202,17 +433,22 @@ flowchart TB
     S3_3 --> Athena
 ```
 
-### 費用内訳 (100GB/月)
+### 費用内訳 (100GB/月、ERROR/WARN 6GB)
 
 | 項目 | 計算 | 費用/月 |
 |------|------|--------|
-| CloudWatch Logs 取り込み (Delivery) | 100GB × $0.25 | $25.00 |
-| CloudWatch Logs 解凍 | 100GB × $0.0042 | $0.42 |
-| **動的パーティショニング** | 100GB × $0.025 | $2.50 |
-| **S3オブジェクト配信** | ~72,000件 × $0.0065/1000 | $0.47 |
-| **JQ処理時間** | ~10時間 × $0.09 | $0.90 |
-| S3 ストレージ | 100GB × $0.025 | $2.50 |
-| **合計** | | **~$31.79** |
+| **アラート用 (Standard)** | | |
+| └ CW Logs 取り込み | 6GB × $0.50 | $3.00 |
+| └ CW Logs 保存 (7日) | 6GB × 7/30 × $0.033 | $0.05 |
+| └ CloudWatch Alarm (3個) | 3 × $0.10 | $0.30 |
+| **ストレージ用 (Delivery→Firehose→S3)** | | |
+| └ CW Logs 取り込み (Delivery) | 100GB × $0.25 | $25.00 |
+| └ CW Logs 解凍 | 100GB × $0.0042 | $0.42 |
+| └ 動的パーティショニング | 100GB × $0.025 | $2.50 |
+| └ S3オブジェクト配信 | ~72,000件 × $0.0065/1000 | $0.47 |
+| └ JQ処理時間 | ~10時間 × $0.09 | $0.90 |
+| └ S3 ストレージ | 100GB × $0.025 | $2.50 |
+| **合計** | | **~$35.14** |
 
 ※ S3オブジェクト数: 100アプリ × 24時間 × 30日 = 72,000件/月
 
@@ -902,25 +1138,26 @@ resource "aws_cloudwatch_log_subscription_filter" "to_opensearch" {
 
 ## 総合比較
 
-### 費用比較グラフ
+### 費用比較グラフ（アラート込み）
 
 ```
-費用 ($/月) - 100GB/月の場合
+費用 ($/月) - 100GB/月の場合（アラート設定込み）
     │
-$100├─────────────────────────────────────────────────── ■ P5: $91.35
+$100├──────────────────────────────────────────────────── ■ P5: $95
     │
- $80├───────────────────────────────────────────────────
+ $80├────────────────────────────────────────────────────
     │
- $60├───────────────────────────────────────────────────
+ $60├────────────────────────────────────────────────────
     │
- $40├───────── ■ P4: $33.93
-    │        ■ P3: $32.34
-    │      ■ P2: $31.79
- $30├──── ■ P1: $27.93
+ $40├────────── ■ P4: $38
+    │         ■ P3: $36
+    │       ■ P2: $35
+    │     ■ P1: $31
+ $30├────────────────────────────────────────────────────
     │
- $20├───────────────────────────────────────────────────
+ $20├────────────────────────────────────────────────────
     │
-    └────────────────────────────────────────────────────
+    └─────────────────────────────────────────────────────
           P1     P2     P3     P4     P5
 ```
 
@@ -928,6 +1165,9 @@ $100├────────────────────────�
 
 | 機能 | P1 基本 | P2 動的 | P3 Parquet | P4 Lambda | P5 Multi |
 |------|:------:|:------:|:----------:|:---------:|:--------:|
+| **アラート（CRIT即時）** | ◎ | ◎ | ◎ | ◎ | ◎ |
+| **アラート（ERROR即時）** | ◎ | ◎ | ◎ | ◎ | ◎ |
+| **アラート（WARN頻度）** | ◎ | ◎ | ◎ | ◎ | ◎ |
 | アプリ別パーティション | × | ◎ | ◎ | ◎ | ◎ |
 | 日付別パーティション | ○ | ◎ | ◎ | ◎ | ◎ |
 | Athena高速クエリ | △ | ○ | ◎ | ○ | ○ |
