@@ -80,6 +80,8 @@ flowchart LR
 
 ## 構成パターン比較サマリ
 
+### Firehose を使うパターン
+
 | # | パターン名 | コスト/月 | Athena最適化 | アラート対応 | 推奨度 |
 |---|-----------|----------|-------------|-------------|--------|
 | 1 | 基本構成（JSON）+ アラート | ~$31 | △ | ◎ CW Metric Filter | ○ |
@@ -87,6 +89,14 @@ flowchart LR
 | 3 | Parquet変換 + アラート | ~$36 | ◎ | ◎ CW Metric Filter | ◎ |
 | 4 | Lambda変換 + 動的パーティション | ~$38 | ◎ | ◎ Lambda内で可 | ○ |
 | 5 | マルチ宛先（S3 + OpenSearch） | ~$95 | ◎ | ◎ OpenSearch | △ |
+
+### Firehose を使わないパターン（学習コスト低）
+
+| # | パターン名 | コスト/月 | 学習コスト | アプリ別分割 | 推奨度 |
+|---|-----------|----------|----------|------------|--------|
+| A | CloudWatch Delivery → S3 直接 | ~$31 | ★☆☆ | × | ◎ |
+| B | Export Task（日次バッチ） | ~$32 | ★☆☆ | × | ○ |
+| C | Subscription Filter → Lambda → S3 | ~$56 | ★★☆ | ◎ | △ |
 
 ### アラート要件（全パターン共通）
 
@@ -1239,6 +1249,726 @@ $100├────────────────────────�
 
 ---
 
+## Firehose を使わないパターン（学習コスト低）
+
+Firehose の学習コストや設定の複雑さを避けたい場合の代替パターン。
+
+### 比較サマリ
+
+| # | パターン名 | コスト/月 | 学習コスト | S3パーティション | アラート | 推奨度 |
+|---|-----------|----------|----------|----------------|---------|--------|
+| A | CloudWatch Delivery → S3 直接 | ~$31 | ★☆☆ | △ 日付のみ | ◎ | ◎ |
+| B | Export Task（日次バッチ） | ~$28 | ★☆☆ | × なし | ◎ | ○ |
+| C | Subscription Filter → Lambda → S3 | ~$33 | ★★☆ | ◎ 自由 | ◎ | ○ |
+
+---
+
+## パターンA: CloudWatch Delivery → S3 直接配信（推奨）
+
+### 概要
+**最もシンプル**。CloudWatch Logs の Delivery 機能で S3 に直接配信。Firehose 不要。
+
+### 構成図
+
+```mermaid
+flowchart TB
+    subgraph Lambdas["Lambda Functions (100個)"]
+        L1[Lambda 1]
+        L2[Lambda 2]
+        L100[Lambda 100]
+    end
+
+    subgraph CloudWatch["CloudWatch Logs"]
+        LG_STD["Standard Class<br/>/app/lambda/errors<br/>ERROR/WARN用"]
+        LG_DEL["Delivery Class<br/>/app/lambda/all<br/>全ログ用"]
+    end
+
+    subgraph Alert["アラート"]
+        MF["Metric Filters"]
+        Alarm["CloudWatch Alarms<br/>CRIT: ≥1/1min<br/>ERROR: ≥1/1min<br/>WARN: ≥10/5min"]
+        SNS["SNS Topics"]
+    end
+
+    subgraph S3["Amazon S3"]
+        Bucket["logs-bucket/<br/>AWSLogs/account-id/<br/>CloudWatchLogs/region/<br/>year/month/day/"]
+    end
+
+    subgraph Analytics["分析"]
+        Athena["Athena"]
+    end
+
+    L1 -->|ERROR/WARN| LG_STD
+    L2 -->|ERROR/WARN| LG_STD
+    L100 -->|ERROR/WARN| LG_STD
+
+    L1 -->|全ログ| LG_DEL
+    L2 -->|全ログ| LG_DEL
+    L100 -->|全ログ| LG_DEL
+
+    LG_STD --> MF
+    MF --> Alarm
+    Alarm --> SNS
+
+    LG_DEL -->|"Delivery (直接)"| Bucket
+
+    Bucket --> Athena
+```
+
+### 費用内訳 (100GB/月、ERROR/WARN 6GB)
+
+| 項目 | 計算 | 費用/月 |
+|------|------|--------|
+| **アラート用 (Standard)** | | |
+| └ CW Logs 取り込み | 6GB × $0.50 | $3.00 |
+| └ CW Logs 保存 (7日) | 6GB × 7/30 × $0.033 | $0.05 |
+| └ CloudWatch Alarm (3個) | 3 × $0.10 | $0.30 |
+| **ストレージ用 (Delivery→S3直接)** | | |
+| └ CW Logs 取り込み (Delivery) | 100GB × $0.25 | $25.00 |
+| └ S3 ストレージ | 100GB × $0.025 | $2.50 |
+| **合計** | | **~$30.85** |
+
+### Terraform実装
+
+```hcl
+# =============================================================================
+# 全ログ用ロググループ (Delivery Class → S3直接)
+# =============================================================================
+resource "aws_cloudwatch_log_group" "all_logs" {
+  name            = "/app/lambda/all"
+  log_group_class = "DELIVERY"  # S3配信専用クラス
+}
+
+# S3バケット
+resource "aws_s3_bucket" "logs" {
+  bucket = "${var.project_name}-logs-${data.aws_caller_identity.current.account_id}"
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "logs" {
+  bucket = aws_s3_bucket.logs.id
+
+  rule {
+    id     = "archive"
+    status = "Enabled"
+
+    transition {
+      days          = 90
+      storage_class = "GLACIER"
+    }
+
+    expiration {
+      days = 365
+    }
+  }
+}
+
+# S3バケットポリシー（CloudWatch Logsからの配信許可）
+resource "aws_s3_bucket_policy" "logs" {
+  bucket = aws_s3_bucket.logs.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AWSLogDeliveryAclCheck"
+        Effect = "Allow"
+        Principal = {
+          Service = "delivery.logs.amazonaws.com"
+        }
+        Action   = "s3:GetBucketAcl"
+        Resource = aws_s3_bucket.logs.arn
+        Condition = {
+          StringEquals = {
+            "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+          }
+        }
+      },
+      {
+        Sid    = "AWSLogDeliveryWrite"
+        Effect = "Allow"
+        Principal = {
+          Service = "delivery.logs.amazonaws.com"
+        }
+        Action   = "s3:PutObject"
+        Resource = "${aws_s3_bucket.logs.arn}/*"
+        Condition = {
+          StringEquals = {
+            "s3:x-amz-acl"      = "bucket-owner-full-control"
+            "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+          }
+        }
+      }
+    ]
+  })
+}
+
+# CloudWatch Logs → S3 配信設定
+resource "aws_cloudwatch_log_delivery_source" "lambda" {
+  name         = "lambda-logs-source"
+  log_group    = aws_cloudwatch_log_group.all_logs.name
+  service_name = "delivery.logs.amazonaws.com"
+}
+
+resource "aws_cloudwatch_log_delivery_destination" "s3" {
+  name = "lambda-logs-s3-destination"
+
+  target {
+    type                            = "S3"
+    resource_arn                    = aws_s3_bucket.logs.arn
+    enable_hive_compatible_path     = true  # Hive互換パス
+  }
+}
+
+resource "aws_cloudwatch_log_delivery" "to_s3" {
+  delivery_destination_arn = aws_cloudwatch_log_delivery_destination.s3.arn
+  delivery_source_name     = aws_cloudwatch_log_delivery_source.lambda.name
+}
+
+# =============================================================================
+# アラート用ロググループ (Standard Class)
+# =============================================================================
+resource "aws_cloudwatch_log_group" "errors" {
+  name              = "/app/lambda/errors"
+  retention_in_days = 7
+}
+
+# Metric Filters & Alarms（パターン1と同じ）
+resource "aws_cloudwatch_log_metric_filter" "critical" {
+  name           = "critical-errors"
+  pattern        = "{ $.level = \"Critical\" }"
+  log_group_name = aws_cloudwatch_log_group.errors.name
+
+  metric_transformation {
+    name          = "CriticalCount"
+    namespace     = "App/Lambda/Logs"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_log_metric_filter" "error" {
+  name           = "errors"
+  pattern        = "{ $.level = \"Error\" }"
+  log_group_name = aws_cloudwatch_log_group.errors.name
+
+  metric_transformation {
+    name          = "ErrorCount"
+    namespace     = "App/Lambda/Logs"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_log_metric_filter" "warn" {
+  name           = "warnings"
+  pattern        = "{ $.level = \"Warning\" || $.level = \"Warn\" }"
+  log_group_name = aws_cloudwatch_log_group.errors.name
+
+  metric_transformation {
+    name          = "WarnCount"
+    namespace     = "App/Lambda/Logs"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+# Alarms
+resource "aws_cloudwatch_metric_alarm" "critical" {
+  alarm_name          = "lambda-critical-alarm"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "CriticalCount"
+  namespace           = "App/Lambda/Logs"
+  period              = 60
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "CRITICAL: 即時対応が必要"
+  alarm_actions       = [aws_sns_topic.critical.arn]
+  treat_missing_data  = "notBreaching"
+}
+
+resource "aws_cloudwatch_metric_alarm" "error" {
+  alarm_name          = "lambda-error-alarm"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ErrorCount"
+  namespace           = "App/Lambda/Logs"
+  period              = 60
+  statistic           = "Sum"
+  threshold           = 1
+  alarm_description   = "ERROR: 当日中に対応"
+  alarm_actions       = [aws_sns_topic.error.arn]
+  treat_missing_data  = "notBreaching"
+}
+
+resource "aws_cloudwatch_metric_alarm" "warn" {
+  alarm_name          = "lambda-warn-alarm"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "WarnCount"
+  namespace           = "App/Lambda/Logs"
+  period              = 300  # 5分
+  statistic           = "Sum"
+  threshold           = 10   # 10件以上
+  alarm_description   = "WARN: 5分間で10件以上"
+  alarm_actions       = [aws_sns_topic.warning.arn]
+  treat_missing_data  = "notBreaching"
+}
+
+# SNS Topics
+resource "aws_sns_topic" "critical" {
+  name = "lambda-logs-critical"
+}
+
+resource "aws_sns_topic" "error" {
+  name = "lambda-logs-error"
+}
+
+resource "aws_sns_topic" "warning" {
+  name = "lambda-logs-warning"
+}
+```
+
+### S3パス構造
+```
+s3://logs-bucket/
+└── AWSLogs/
+    └── 123456789012/
+        └── CloudWatchLogs/
+            └── ap-northeast-1/
+                └── 2026/
+                    └── 01/
+                        └── 28/
+                            └── xxx.log.gz
+```
+
+### メリット・デメリット
+
+| メリット | デメリット |
+|---------|-----------|
+| **Firehose不要で最もシンプル** | アプリ別パーティションができない |
+| 学習コストが最も低い | パス構造が固定 |
+| コストも低い | |
+| Terraform設定も少ない | |
+
+---
+
+## パターンB: Export Task（日次バッチエクスポート）
+
+### 概要
+EventBridge + Lambda で毎日定時に前日のログをS3にエクスポート。**リアルタイム性不要な場合**に最適。
+
+### 構成図
+
+```mermaid
+flowchart TB
+    subgraph Lambdas["Lambda Functions (100個)"]
+        L1[Lambda 1]
+        L2[Lambda 2]
+        L100[Lambda 100]
+    end
+
+    subgraph CloudWatch["CloudWatch Logs (Standard)"]
+        LG["共通ロググループ<br/>/app/lambda/all"]
+    end
+
+    subgraph Alert["アラート"]
+        MF["Metric Filters"]
+        Alarm["CloudWatch Alarms"]
+        SNS["SNS Topics"]
+    end
+
+    subgraph Scheduler["スケジューラ"]
+        EB["EventBridge Rule<br/>毎日 AM 1:00"]
+        ExportLambda["Export Lambda<br/>CreateExportTask API"]
+    end
+
+    subgraph S3["Amazon S3"]
+        Bucket["logs-bucket/<br/>exports/2026/01/28/"]
+    end
+
+    L1 --> LG
+    L2 --> LG
+    L100 --> LG
+
+    LG --> MF
+    MF --> Alarm
+    Alarm --> SNS
+
+    EB -->|毎日実行| ExportLambda
+    ExportLambda -->|"前日分エクスポート"| LG
+    LG -.->|エクスポート| Bucket
+```
+
+### 費用内訳 (100GB/月)
+
+| 項目 | 計算 | 費用/月 |
+|------|------|--------|
+| **CloudWatch Logs (Standard)** | | |
+| └ 取り込み | 100GB × $0.50 | $50.00 |
+| └ 保存 (7日) | 100GB × 7/30 × $0.033 | $0.77 |
+| └ CloudWatch Alarm (3個) | 3 × $0.10 | $0.30 |
+| **エクスポート** | | |
+| └ Export Task | 無料 | $0.00 |
+| └ Export Lambda | 30回 × 128MB × 10秒 | ~$0.01 |
+| **S3** | | |
+| └ ストレージ | 100GB × $0.025 | $2.50 |
+| **合計** | | **~$53.58** |
+
+**注意**: CloudWatch Standard を使うためコストが高い
+
+### 費用最適化版（Infrequent Access使用）
+
+| 項目 | 計算 | 費用/月 |
+|------|------|--------|
+| **CloudWatch Logs (Infrequent Access)** | | |
+| └ 取り込み | 100GB × $0.25 | $25.00 |
+| └ 保存 (7日) | 100GB × 7/30 × $0.033 | $0.77 |
+| **アラート用 (Standard, ERROR/WARNのみ)** | | |
+| └ 取り込み | 6GB × $0.50 | $3.00 |
+| └ CloudWatch Alarm (3個) | 3 × $0.10 | $0.30 |
+| **S3** | | |
+| └ ストレージ | 100GB × $0.025 | $2.50 |
+| **合計** | | **~$31.57** |
+
+**注意**: Infrequent Access クラスは Export Task をサポートしない。
+この構成ではアラート用 Standard + 保存用 IA の2ロググループが必要。
+
+### Terraform実装（Export Lambda）
+
+```hcl
+# EventBridge Rule (毎日 AM 1:00 JST = 16:00 UTC)
+resource "aws_cloudwatch_event_rule" "daily_export" {
+  name                = "daily-log-export"
+  schedule_expression = "cron(0 16 * * ? *)"  # 毎日 16:00 UTC
+}
+
+resource "aws_cloudwatch_event_target" "export_lambda" {
+  rule      = aws_cloudwatch_event_rule.daily_export.name
+  target_id = "export-lambda"
+  arn       = aws_lambda_function.exporter.arn
+}
+
+# Export Lambda
+resource "aws_lambda_function" "exporter" {
+  function_name = "log-exporter"
+  role          = aws_iam_role.exporter.arn
+  handler       = "index.handler"
+  runtime       = "nodejs20.x"
+  timeout       = 300
+
+  environment {
+    variables = {
+      LOG_GROUP_NAME = aws_cloudwatch_log_group.all_logs.name
+      S3_BUCKET      = aws_s3_bucket.logs.id
+    }
+  }
+
+  filename = data.archive_file.exporter.output_path
+}
+
+# Export Lambda の IAM ロール
+resource "aws_iam_role" "exporter" {
+  name = "log-exporter-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "exporter" {
+  name = "log-exporter-policy"
+  role = aws_iam_role.exporter.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["logs:CreateExportTask", "logs:DescribeExportTasks"]
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:PutObject", "s3:GetBucketAcl"]
+        Resource = ["${aws_s3_bucket.logs.arn}", "${aws_s3_bucket.logs.arn}/*"]
+      }
+    ]
+  })
+}
+```
+
+### Export Lambda コード (Node.js)
+
+```javascript
+const { CloudWatchLogsClient, CreateExportTaskCommand } = require('@aws-sdk/client-cloudwatch-logs');
+
+const client = new CloudWatchLogsClient({});
+
+exports.handler = async (event) => {
+  const logGroupName = process.env.LOG_GROUP_NAME;
+  const s3Bucket = process.env.S3_BUCKET;
+  
+  // 昨日の 00:00:00 ～ 23:59:59
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  yesterday.setHours(0, 0, 0, 0);
+  
+  const from = yesterday.getTime();
+  const to = from + 24 * 60 * 60 * 1000 - 1;
+  
+  const dateStr = yesterday.toISOString().split('T')[0].replace(/-/g, '/');
+  
+  const command = new CreateExportTaskCommand({
+    logGroupName,
+    from,
+    to,
+    destination: s3Bucket,
+    destinationPrefix: `exports/${dateStr}`
+  });
+  
+  const response = await client.send(command);
+  console.log(`Export task created: ${response.taskId}`);
+  
+  return { statusCode: 200, body: `Task ID: ${response.taskId}` };
+};
+```
+
+### メリット・デメリット
+
+| メリット | デメリット |
+|---------|-----------|
+| 追加サービス不要 | **リアルタイム性なし（1日遅れ）** |
+| コストが予測しやすい | 同時に1タスクのみ |
+| 設定がシンプル | エクスポート完了まで最大12時間 |
+| | Standard クラスのみ対応 |
+
+---
+
+## パターンC: Subscription Filter → Lambda → S3
+
+### 概要
+Subscription Filter で Lambda を呼び出し、Lambda から直接 S3 に書き込む。
+**アプリ別パーティションが必要だがFirehoseを避けたい**場合。
+
+### 構成図
+
+```mermaid
+flowchart TB
+    subgraph Lambdas["Lambda Functions (100個)"]
+        L1[Lambda 1]
+        L2[Lambda 2]
+        L100[Lambda 100]
+    end
+
+    subgraph CloudWatch["CloudWatch Logs"]
+        LG_STD["Standard Class<br/>ERROR/WARN用"]
+        LG_DEL["Standard Class<br/>全ログ用"]
+    end
+
+    subgraph Alert["アラート"]
+        MF["Metric Filters"]
+        Alarm["CloudWatch Alarms"]
+        SNS["SNS Topics"]
+    end
+
+    subgraph Processing["ログ処理"]
+        SF["Subscription Filter"]
+        ProcLambda["処理Lambda<br/>・パース<br/>・パーティション決定<br/>・S3書込み"]
+    end
+
+    subgraph S3["Amazon S3"]
+        Bucket["logs-bucket/<br/>app=xxx/<br/>year=2026/month=01/day=28/"]
+    end
+
+    L1 -->|ERROR/WARN| LG_STD
+    L2 -->|ERROR/WARN| LG_STD
+
+    L1 -->|全ログ| LG_DEL
+    L2 -->|全ログ| LG_DEL
+    L100 -->|全ログ| LG_DEL
+
+    LG_STD --> MF
+    MF --> Alarm
+    Alarm --> SNS
+
+    LG_DEL --> SF
+    SF --> ProcLambda
+    ProcLambda --> Bucket
+```
+
+### 費用内訳 (100GB/月)
+
+| 項目 | 計算 | 費用/月 |
+|------|------|--------|
+| **アラート用 (Standard)** | | |
+| └ CW Logs 取り込み | 6GB × $0.50 | $3.00 |
+| └ CW Logs 保存 (7日) | 6GB × 7/30 × $0.033 | $0.05 |
+| └ CloudWatch Alarm (3個) | 3 × $0.10 | $0.30 |
+| **全ログ用 (Standard)** | | |
+| └ CW Logs 取り込み | 100GB × $0.50 | $50.00 |
+| └ CW Logs 保存 (1日) | 100GB × 1/30 × $0.033 | $0.11 |
+| **処理Lambda** | | |
+| └ 実行 | ~10,000回 × 256MB × 1秒 | $0.42 |
+| **S3** | | |
+| └ ストレージ | 100GB × $0.025 | $2.50 |
+| └ PUT リクエスト | ~10,000件 × $0.0047/1000 | $0.05 |
+| **合計** | | **~$56.43** |
+
+**注意**: Subscription Filter は Standard クラスのみ対応のため、全ログ分のコストがかかる。
+
+### 費用最適化版（Delivery Class + Firehose代替）
+
+実は **CloudWatch Delivery → Lambda は直接呼び出せない** ため、
+この構成では Standard クラスが必要でコストが高くなる。
+
+**結論**: アプリ別パーティションが必要な場合は **Firehose パターン2** の方が低コスト。
+
+### 処理Lambda コード (C#)
+
+```csharp
+using Amazon.Lambda.CloudWatchLogsEvents;
+using Amazon.Lambda.Core;
+using Amazon.S3;
+using Amazon.S3.Model;
+using System.IO.Compression;
+using System.Text;
+using System.Text.Json;
+
+[assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
+
+namespace LogProcessor;
+
+public class Function
+{
+    private readonly IAmazonS3 _s3 = new AmazonS3Client();
+    private readonly string _bucketName = Environment.GetEnvironmentVariable("S3_BUCKET")!;
+
+    public async Task FunctionHandler(CloudWatchLogsEvent logsEvent, ILambdaContext context)
+    {
+        // Base64 + gzip デコード
+        var compressedData = Convert.FromBase64String(logsEvent.Awslogs.Data);
+        using var compressedStream = new MemoryStream(compressedData);
+        using var gzipStream = new GZipStream(compressedStream, CompressionMode.Decompress);
+        using var reader = new StreamReader(gzipStream);
+        var json = await reader.ReadToEndAsync();
+        
+        var logData = JsonSerializer.Deserialize<CloudWatchLogsData>(json);
+        
+        // ログをアプリ別にグループ化
+        var logsByApp = logData.LogEvents
+            .Select(e => JsonSerializer.Deserialize<LogEntry>(e.Message))
+            .Where(e => e != null)
+            .GroupBy(e => e!.FunctionName ?? "unknown");
+        
+        foreach (var group in logsByApp)
+        {
+            var appName = group.Key;
+            var now = DateTime.UtcNow;
+            var key = $"logs/app={appName}/year={now:yyyy}/month={now:MM}/day={now:dd}/{Guid.NewGuid()}.json";
+            
+            var content = string.Join("\n", group.Select(e => JsonSerializer.Serialize(e)));
+            
+            await _s3.PutObjectAsync(new PutObjectRequest
+            {
+                BucketName = _bucketName,
+                Key = key,
+                ContentBody = content,
+                ContentType = "application/json"
+            });
+        }
+    }
+}
+
+public class CloudWatchLogsData
+{
+    public string Owner { get; set; }
+    public string LogGroup { get; set; }
+    public string LogStream { get; set; }
+    public List<LogEvent> LogEvents { get; set; }
+}
+
+public class LogEvent
+{
+    public string Id { get; set; }
+    public long Timestamp { get; set; }
+    public string Message { get; set; }
+}
+
+public class LogEntry
+{
+    public string? Timestamp { get; set; }
+    public string? Level { get; set; }
+    public string? FunctionName { get; set; }
+    public string? Message { get; set; }
+}
+```
+
+### メリット・デメリット
+
+| メリット | デメリット |
+|---------|-----------|
+| アプリ別パーティション可能 | **コストが高い** |
+| Firehose不要 | Lambda の実装・保守コスト |
+| 柔軟なデータ変換 | Subscription Filter は Standard のみ |
+
+---
+
+## Firehose あり vs なし 総合比較
+
+| 項目 | P1 Firehose基本 | P2 Firehose動的 | A 直接配信 | B Export | C Lambda |
+|------|:--------------:|:--------------:|:---------:|:--------:|:--------:|
+| **月額コスト** | ~$31 | ~$35 | **~$31** | ~$32 | ~$56 |
+| **学習コスト** | ★★☆ | ★★★ | **★☆☆** | **★☆☆** | ★★☆ |
+| **アプリ別パーティション** | × | ◎ | × | × | ◎ |
+| **リアルタイム性** | ○ | ○ | ○ | × | ○ |
+| **アラート** | ◎ | ◎ | ◎ | ◎ | ◎ |
+| **Athena最適化** | △ | ◎ | △ | △ | ◎ |
+| **推奨度** | ○ | ◎ | **◎** | ○ | △ |
+
+### 選択ガイド
+
+```
+┌─────────────────────────────────────────┐
+│ アプリ別パーティションが必要？            │
+└───────────────────┬─────────────────────┘
+                    │
+       ┌────────────┴────────────┐
+       ▼                         ▼
+     はい                      いいえ
+       │                         │
+       ▼                         ▼
+┌─────────────────┐    ┌─────────────────────┐
+│ Firehose学習OK？│    │ リアルタイム必要？   │
+└────────┬────────┘    └──────────┬──────────┘
+         │                        │
+    ┌────┴────┐            ┌──────┴──────┐
+    ▼         ▼            ▼             ▼
+  はい      いいえ        はい          いいえ
+    │         │            │             │
+    ▼         ▼            ▼             ▼
+┌───────┐ ┌───────┐  ┌─────────┐   ┌─────────┐
+│ P2    │ │ C     │  │ A 直接  │   │ B Export│
+│ 動的  │ │Lambda │  │ 推奨◎  │   │         │
+│ 推奨◎│ │       │  └─────────┘   └─────────┘
+└───────┘ └───────┘
+```
+
+### 最終推奨
+
+| ユースケース | 推奨パターン |
+|-------------|-------------|
+| **シンプルに始めたい** | **パターンA（Delivery直接配信）** |
+| **アプリ別分析が必要** | パターン2（Firehose動的パーティション） |
+| **Athena高速クエリ重視** | パターン3（Firehose + Parquet） |
+| **バッチ処理で十分** | パターンB（Export Task） |
+
+---
+
 ## 参考情報
 
 ### Firehose 関連
@@ -1270,6 +2000,16 @@ $100├────────────────────────�
 | ログデータのS3エクスポート | https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/S3Export.html |
 | CreateExportTask API | https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_CreateExportTask.html |
 | Vended Logs の S3 送信 | https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/AWS-logs-infrastructure-V2-S3.html |
+| CreateDelivery API | https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_CreateDelivery.html |
+| PutDeliveryDestination API | https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_PutDeliveryDestination.html |
+| S3への配信設定 | https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/AWS-logs-infrastructure-S3.html |
+
+### Subscription Filter
+
+| トピック | URL |
+|---------|-----|
+| サブスクリプションフィルター | https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/SubscriptionFilters.html |
+| Lambda による処理 | https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/SubscriptionFilters.html#LambdaFunctionExample |
 
 ### Powertools
 
